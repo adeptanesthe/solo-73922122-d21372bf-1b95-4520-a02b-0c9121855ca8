@@ -1,0 +1,14 @@
+services:
+  # 慢 GDAL 演示覆盖(可选):
+  #   docker compose -f docker-compose.yml -f docker-compose.demo.yml up
+  # SLOW_GDAL_FACTOR: 阶段启动延迟(拉宽"迟到进程"窗口)
+  # SLOW_GDAL_AFTER_FACTOR: 阶段产出后延迟退出(拉宽"阶段交接"窗口)
+  web:
+    environment:
+      SLOW_GDAL_FACTOR: "${SLOW_GDAL_FACTOR:-8}"
+      SLOW_GDAL_AFTER_FACTOR: "${SLOW_GDAL_AFTER_FACTOR:-2}"
+      # 上传校验用的 gdalinfo 不加延迟,提交任务仍然很快
+      SLOW_GDAL_DELAY_GDALINFO: "0"
+      SLOW_GDAL_AFTER_DELAY_GDALINFO: "0"
+    # stop_grace_period 必须大于应用收尾所需时间,否则会被 docker 再发 SIGKILL
+    stop_grace_period: "${STOP_GRACE_PERIOD:-120s}"

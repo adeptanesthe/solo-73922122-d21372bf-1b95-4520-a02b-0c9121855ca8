@@ -1,5 +1,3 @@
-name: dem-mosaic
-
 services:
   # 一次性任务:生成不同坐标系/重叠/NoData 的演示样例,完成后退出
   samplegen:
@@ -23,6 +21,11 @@ services:
       DATA_DIR: /data
       SAMPLES_DIR: /data/samples
       MAX_PARALLEL: "2"
+      SHUTDOWN_TIMEOUT: "15"
+      # 默认不引入演示延迟;演示用 docker-compose.demo.yml 覆盖
+      SLOW_GDAL_FACTOR: "0"
+    # 大于 SHUTDOWN_TIMEOUT,确保应用能自行收尾而不是被 docker 强杀
+    stop_grace_period: 120s
     depends_on:
       samplegen:
         condition: service_completed_successfully

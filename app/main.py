@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -13,13 +14,16 @@ from typing import List, Optional
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 
-from taskmanager import STATUS_DONE, TaskManager
+from taskmanager import STATUS_DONE, ShuttingDown, Task, TaskManager
+
+logger = logging.getLogger("uvicorn.error")
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR.parent / "data"))
 SAMPLES_DIR = Path(os.environ.get("SAMPLES_DIR", DATA_DIR / "samples"))
 TASKS_ROOT = DATA_DIR / "tasks"
 MAX_PARALLEL = int(os.environ.get("MAX_PARALLEL", "2"))
+SHUTDOWN_TIMEOUT = float(os.environ.get("SHUTDOWN_TIMEOUT", "15"))
 MAX_INPUTS = 4
 SAMPLE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.tiff?$", re.IGNORECASE)
 
@@ -31,9 +35,18 @@ async def lifespan(app: FastAPI):
     global manager
     TASKS_ROOT.mkdir(parents=True, exist_ok=True)
     SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
-    manager = TaskManager(TASKS_ROOT, max_parallel=MAX_PARALLEL)
+    manager = TaskManager(
+        TASKS_ROOT, max_parallel=MAX_PARALLEL, shutdown_timeout=SHUTDOWN_TIMEOUT
+    )
+    # 启动清理沿用原规则:清空上次运行遗留的暂存目录
     manager.cleanup_stale()
-    yield
+    try:
+        yield
+    finally:
+        # 停机收尾:拒绝新任务 -> 停止排队/运行中任务 -> 回收全部 GDAL 进程
+        # -> 等待后台协程结束 -> 清理未完成任务目录(已完成结果本次保留)。
+        await manager.shutdown()
+        logger.info("服务关闭收尾完成")
 
 
 app = FastAPI(title="DEM 拼接服务", lifespan=lifespan)
@@ -48,6 +61,14 @@ async def index():
 
 @app.get("/healthz")
 async def healthz():
+    return {"ok": True}
+
+
+@app.get("/readyz")
+async def readyz():
+    """关闭开始后返回 503,便于停机期间拒绝新流量。"""
+    if manager.closing:
+        raise HTTPException(503, "服务正在关闭")
     return {"ok": True}
 
 
@@ -96,6 +117,26 @@ async def create_task(
     """plan 为 JSON 数组,按覆盖优先级从低到高排列:
     [{"type":"upload","index":0}, {"type":"sample","name":"dem_A_utm32n.tif"}]
     """
+    if manager.closing:
+        raise HTTPException(503, "服务正在关闭,不再接受新任务")
+    try:
+        task = await _prepare_task(resolution, plan, files)
+    except ShuttingDown:
+        # 校验期间进入关闭窗口,create 拒绝建立任务
+        raise HTTPException(503, "服务正在关闭,不再接受新任务")
+    try:
+        queued = manager.enqueue(task)
+    except ShuttingDown:
+        queued = False
+    if not queued:
+        # 关闭窗口内被拒绝:入队未发生,清掉刚建好的暂存目录
+        manager.discard(task)
+        raise HTTPException(503, "服务正在关闭,不再接受新任务")
+    return task.public()
+
+
+async def _prepare_task(resolution: float, plan: str, files) -> Task:
+    """校验 plan,写入并校验输入(不调度);失败时自行清理。"""
     if not (0 < resolution <= 10000):
         raise HTTPException(400, "目标像元边长必须为大于 0 的数(米)")
     try:
@@ -137,10 +178,11 @@ async def create_task(
         raise
     except Exception as e:
         manager.discard(task)
+        if manager.closing:
+            # 收尾进行中目录被清理,或输入准备被停机打断:按关闭处理
+            raise HTTPException(503, "服务正在关闭,不再接受新任务")
         raise HTTPException(400, f"保存输入失败: {e}")
-
-    manager.enqueue(task)
-    return task.public()
+    return task
 
 
 @app.post("/api/tasks/{task_id}/cancel")
